@@ -1,5 +1,5 @@
 import ray
-from ray import serve
+from ray import ObjectRef, serve
 
 import torch
 from torchvision import transforms
@@ -17,21 +17,14 @@ import requests
 
 
 @ray.remote
-class Downloader:
-    def __init__(self):
-        pass
-
+def download(url):
+    return requests.get(url).content
 
 @ray.remote
 class Preprocessor:
     def __init__(self):
-        pass
+        from torchvision import transforms
 
-
-@ray.remote
-class ResNetClassify:
-    def __init__(self):
-        self.model = resnet18(pretrained=True).eval()
         self.preprocessor = transforms.Compose(
             [
                 transforms.Resize(224),
@@ -44,28 +37,31 @@ class ResNetClassify:
             ]
         )
 
-    def forward(self, image_payload_bytes):
+    def preprocess(self, image_payload_bytes) -> ObjectRef:
         pil_image = Image.open(BytesIO(image_payload_bytes))
-        print("[1/3] Parsed image data: {}".format(pil_image))
-
         pil_images = [pil_image]  # Our current batch size is one
         input_tensor = torch.cat(
             [self.preprocessor(i).unsqueeze(0) for i in pil_images]
         )
-        print(
-            "[2/3] Images transformed, tensor shape {}".format(
-                input_tensor.shape
-            )
-        )
+        # Cache in plasma throughout duration of request
+        return ray.put(input_tensor)
+
+
+@ray.remote
+class ResNetClassify:
+    def __init__(self):
+        self.model = resnet18(pretrained=True).eval()
+
+    def forward(self, input_tensor_objectref):
+        input_tensor = ray.get(input_tensor_objectref)
 
         with torch.no_grad():
             output_tensor = self.model(input_tensor)
-        print("[3/3] Inference done!")
         return {"class_index": int(torch.argmax(output_tensor[0]))}
 
 
 @ray.remote
-class Hate:
+class HatefulMeme:
     def __init__(self) -> None:
         from mmf.models.mmbt import MMBT
         self.model = MMBT.from_pretrained("mmbt.hateful_memes.images")
@@ -92,29 +88,33 @@ class Composition:
 if __name__ == "__main__":
     print(1)
     # Return image with metadata
-    # ray_logo_bytes = requests.get(
-    #     "https://ichef.bbci.co.uk/news/1024/branded_news/0D9B/production/_88738430_pic1go.jpg"
-    # ).content
+    url = "https://ichef.bbci.co.uk/news/1024/branded_news/0D9B/production/_88738430_pic1go.jpg"
 
+    downloaded_image_bytes = download.bind(url)
+    preprocessor = Preprocessor.bind()
+    input_tensor_objectref = preprocessor.preprocess.bind(downloaded_image_bytes)
+    resnet = ResNetClassify.bind()
+    dag = resnet.forward.bind(input_tensor_objectref)
+    print(ray.get(dag.execute()))
     # model = ModelOne.bind()
     # model_2 = ModelTwo.bind()
     # dag = model_2.forward.bind()
     # print(model_2)
     # dag = model.forward.bind(ray_logo_bytes)
     # print(ray.get(dag.execute()))
-    config = [
-        "config=projects/pythia/configs/textvqa/defaults.yaml",
-        # "datasets=textvqa",
-        "model=pythia",
-        "run_type=test",
-        "checkpoint.resume_zoo=/Users/jiaodong/Workspace/mmf/checkpoint/pythia_pretrained_vqa2.pth"
-    ]
-    model_2_actor = ModelTwo.remote("args")
-    print(
-        ray.get(
-            model_2_actor.forward.remote(
-                "https://ichef.bbci.co.uk/news/1024/branded_news/0D9B/production/_88738430_pic1go.jpg",
-                "What is it",
-            )
-        )
-    )
+    # config = [
+    #     "config=projects/pythia/configs/textvqa/defaults.yaml",
+    #     # "datasets=textvqa",
+    #     "model=pythia",
+    #     "run_type=test",
+    #     "checkpoint.resume_zoo=/Users/jiaodong/Workspace/mmf/checkpoint/pythia_pretrained_vqa2.pth"
+    # ]
+    # model_2_actor = ModelTwo.remote("args")
+    # print(
+    #     ray.get(
+    #         model_2_actor.forward.remote(
+    #             "https://ichef.bbci.co.uk/news/1024/branded_news/0D9B/production/_88738430_pic1go.jpg",
+    #             "What is it",
+    #         )
+    #     )
+    # )
