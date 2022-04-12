@@ -264,24 +264,24 @@ def combine(resnet, mask_r_cnn, captioning):
 #     show(dogs_with_boxes)
 
 
+# Let's build the DAG
 def input_schema_from_args(image_url: str, user_id: int) :
     return ContentInput(image_url=image_url, user_id=user_id)
-
 
 preprocessor = Preprocessor.bind()
 resnets = [
     ResNetClassify.bind(version=i)
     for i in range(3)
 ]
+dispatch = DynamicDispatch.bind(*resnets)
 mask_rcnn = MaskRCNN.bind()
 image_caption = ImageCaption.bind()
 with InputNode() as inp:
     downloaded_image_bytes = download.bind(inp)
-    input_tensor_objectref = preprocessor.preprocess.bind(downloaded_image_bytes)
+    input_tensor = preprocessor.preprocess.bind(downloaded_image_bytes)
 
-    dispatch = DynamicDispatch.bind(*resnets)
-    resnet_output = dispatch.forward.bind(input_tensor_objectref, inp)
-    mask_rcnnoutput = mask_rcnn.forward.bind(input_tensor_objectref)
+    resnet_output = dispatch.forward.bind(input_tensor, inp)
+    mask_rcnnoutput = mask_rcnn.forward.bind(input_tensor)
     image_caption_output = image_caption.forward.bind(mask_rcnnoutput, resnet_output)
 
     dag = combine.bind(resnet_output, mask_rcnnoutput, image_caption_output)
