@@ -128,7 +128,7 @@ class Preprocessor:
 
 
 @serve.deployment
-class ResNetClassify:
+class ImageClassification_ResNet:
     def __init__(self, version: int):
         # Read the categories
         with open("imagenet_classes.txt", "r") as f:
@@ -161,7 +161,7 @@ class ResNetClassify:
         }
 
 @serve.deployment
-class MaskRCNN:
+class ObjectDetection_MaskRCNN:
     def __init__(self):
         self.model = models.detection.maskrcnn_resnet50_fpn(pretrained=True).eval()
 
@@ -172,7 +172,7 @@ class MaskRCNN:
         return [{k: v.numpy() for k,v in box.items()} for box in output_boxes]
 
 @serve.deployment
-class ImageCaption:
+class ImageCaption_ResNet_LSTM:
     def __init__(self):
         # Load vocabulary wrapper
         import json
@@ -270,12 +270,13 @@ def input_schema_from_args(image_url: str, user_id: int) :
 
 preprocessor = Preprocessor.bind()
 resnets = [
-    ResNetClassify.bind(version=i)
+    ImageClassification_ResNet.bind(version=i)
     for i in range(3)
 ]
 resnet_dispatch = DynamicDispatch.bind(*resnets)
-mask_rcnn = MaskRCNN.bind()
-image_caption = ImageCaption.bind()
+mask_rcnn = ObjectDetection_MaskRCNN.bind()
+image_caption = ImageCaption_ResNet_LSTM.bind()
+
 with InputNode() as inp:
     downloaded_image_bytes = download.bind(inp)
     input_tensor = preprocessor.preprocess.bind(downloaded_image_bytes)
@@ -293,4 +294,3 @@ if __name__ == "__main__":
     url = "https://miro.medium.com/max/1400/1*gMR3ezxjF46IykyTK6MV9w.jpeg"
     rst = ray.get(dag.execute(ContentInput(image_url=url, user_id=2)))
     print(rst)
-
