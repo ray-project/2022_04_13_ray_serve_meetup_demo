@@ -1,5 +1,5 @@
 ray[serve]
 torch
-trochvision
+torchvision
 pillow
 nltk
