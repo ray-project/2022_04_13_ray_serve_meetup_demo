@@ -190,7 +190,7 @@ class ImageCaption:
         self.encoder.load_state_dict(torch.load("models/encoder-5-3000.pkl"))
         self.decoder.load_state_dict(torch.load("models/decoder-5-3000.pkl"))
 
-    def forward(self, mask_rnn_reslt, resnet_result):
+    def forward(self, mask_rnn_result, resnet_result):
         resnet_feature = resnet_result["last_layer_weights"]
 
         # Generate an caption from the image
@@ -224,7 +224,7 @@ class DynamicDispatch:
 def combine(resnet, mask_r_cnn, captioning):
     return {
         "captioning": captioning,
-        # "resnet": resnet,
+        "resnet_version": resnet["model_version"],
         # "mask_r_cnn": mask_r_cnn
         # no resnet and mask result direclty, too many nubmers and have json serde issue.
     }
@@ -273,14 +273,14 @@ resnets = [
     ResNetClassify.bind(version=i)
     for i in range(3)
 ]
-dispatch = DynamicDispatch.bind(*resnets)
+resnet_dispatch = DynamicDispatch.bind(*resnets)
 mask_rcnn = MaskRCNN.bind()
 image_caption = ImageCaption.bind()
 with InputNode() as inp:
     downloaded_image_bytes = download.bind(inp)
     input_tensor = preprocessor.preprocess.bind(downloaded_image_bytes)
 
-    resnet_output = dispatch.forward.bind(input_tensor, inp)
+    resnet_output = resnet_dispatch.forward.bind(input_tensor, inp)
     mask_rcnnoutput = mask_rcnn.forward.bind(input_tensor)
     image_caption_output = image_caption.forward.bind(mask_rcnnoutput, resnet_output)
 
