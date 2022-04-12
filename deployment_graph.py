@@ -96,7 +96,11 @@ class ContentInput(BaseModel):
     image_url: str
     user_id: int
 
-@serve.deployment
+@serve.deployment(
+    ray_actor_options={
+        "num_cpus": 0.5
+    }
+)
 def download(inp: "ContentInput"):
     """Download HTTP content, in production this can be business logic downloading from other services"""
     return requests.get(inp.image_url).content
@@ -127,7 +131,11 @@ class Preprocessor:
         return ray.put(input_tensor)
 
 
-@serve.deployment
+@serve.deployment(
+    ray_actor_options={
+        "num_cpus": 0.5
+    }
+)
 class ImageClassification_ResNet:
     def __init__(self, version: int):
         # Read the categories
@@ -160,7 +168,11 @@ class ImageClassification_ResNet:
             "last_layer_weights": feat.numpy(),
         }
 
-@serve.deployment
+@serve.deployment(
+    ray_actor_options={
+        "num_cpus": 0.5
+    }
+)
 class ObjectDetection_MaskRCNN:
     def __init__(self):
         self.model = models.detection.maskrcnn_resnet50_fpn(pretrained=True).eval()
@@ -171,7 +183,11 @@ class ObjectDetection_MaskRCNN:
             output_boxes = self.model(input_tensor)
         return [{k: v.numpy() for k,v in box.items()} for box in output_boxes]
 
-@serve.deployment
+@serve.deployment(
+    ray_actor_options={
+        "num_cpus": 0.5
+    }
+)
 class ImageCaption_ResNet_LSTM:
     def __init__(self):
         # Load vocabulary wrapper
@@ -209,7 +225,11 @@ class ImageCaption_ResNet_LSTM:
 
         return sentence
 
-@serve.deployment
+@serve.deployment(
+    ray_actor_options={
+        "num_cpus": 0.5
+    }
+)
 class DynamicDispatch:
     def __init__(self, *handles):
         self.handles = handles
@@ -220,7 +240,11 @@ class DynamicDispatch:
         chosen_handle = self.handles[chosen_idx]
         return await chosen_handle.forward.remote(inp_tensor)
 
-@serve.deployment
+@serve.deployment(
+    ray_actor_options={
+        "num_cpus": 0.5
+    }
+)
 def combine(resnet, mask_r_cnn, captioning):
     return {
         "captioning": captioning,
