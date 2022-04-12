@@ -1,0 +1,5 @@
+ray[serve]
+torch
+trochvision
+pillow
+nltk

@@ -1,21 +1,21 @@
-import ray
-from ray import ObjectRef, serve
-
-import torch
-from torchvision.models import resnet50
-import nltk
-nltk.download('punkt')
-
 from io import BytesIO
-from PIL import Image
+from pydantic import BaseModel
 
 import requests
-
 import torch
 import torch.nn as nn
 import torchvision.models as models
+from torchvision import transforms
+from PIL import Image
 from torch.nn.utils.rnn import pack_padded_sequence
 
+import ray
+from ray import serve
+from ray.experimental.dag.input_node import InputNode
+from ray.serve.drivers import DAGDriver
+
+
+# Model classes
 class Vocabulary(object):
     """Simple vocabulary wrapper."""
     def __init__(self, word2idx, idx2word, idx):
@@ -47,10 +47,11 @@ class EncoderCNN(nn.Module):
         self.linear = nn.Linear(resnet.fc.in_features, embed_size)
         self.bn = nn.BatchNorm1d(embed_size, momentum=0.01)
 
-    def forward(self, images):
+    def forward(self, features):
         """Extract feature vectors from input images."""
-        with torch.no_grad():
-            features = self.resnet(images)
+        # with torch.no_grad():
+        #     features = self.resnet(images)
+        features = torch.Tensor(features.copy())
         features = features.reshape(features.size(0), -1)
         features = self.bn(self.linear(features))
         return features
@@ -88,16 +89,22 @@ class DecoderRNN(nn.Module):
         sampled_ids = torch.stack(sampled_ids, 1)                # sampled_ids: (batch_size, max_seq_length)
         return sampled_ids
 
+#############
+# Serve Graph Nodes
 
-@ray.remote
-def download(url):
-    return requests.get(url).content
+class ContentInput(BaseModel):
+    image_url: str
+    user_id: int
 
-@ray.remote
+@serve.deployment
+def download(inp: "ContentInput"):
+    """Download HTTP content, in production this can be business logic downloading from other services"""
+    return requests.get(inp.image_url).content
+
+@serve.deployment
 class Preprocessor:
+    """Image preprocessor with imagenet normalization."""
     def __init__(self):
-        from torchvision import transforms
-
         self.preprocessor = transforms.Compose(
             [
                 transforms.Resize([224, 224]),
@@ -113,47 +120,58 @@ class Preprocessor:
             ]
         )
 
-    def preprocess(self, image_payload_bytes) -> ObjectRef:
+    def preprocess(self, image_payload_bytes) -> ray.ObjectRef:
         pil_image = Image.open(BytesIO(image_payload_bytes)).convert('RGB')
         input_tensor = self.preprocessor(pil_image).unsqueeze(0)
         # Cache in plasma throughout duration of request
         return ray.put(input_tensor)
 
 
-@ray.remote
+@serve.deployment
 class ResNetClassify:
-    def __init__(self):
-        self.model = resnet50(pretrained=True).eval()
+    def __init__(self, version: int):
         # Read the categories
         with open("imagenet_classes.txt", "r") as f:
             self.categories = [s.strip() for s in f.readlines()]
+        self.version = version
+
+        resnet_model = models.resnet152(pretrained=True).eval()
+        self.head = torch.nn.Sequential(*list(resnet_model.children())[:-1])
+        self.tail = list(resnet_model.children())[-1]
 
 
-    def forward(self, input_tensor_objectref):
-        rst = []
-        input_tensor = ray.get(input_tensor_objectref)
-        output_tensor = self.model(input_tensor)
+    def forward(self, input_tensor):
+        # input_tensor = ray.get(input_tensor_objectref)
+        with torch.no_grad():
+            feat = self.head(input_tensor)
+            output_tensor = self.tail(feat.reshape(feat.size(0), -1))
+
 
         probabilities = torch.nn.functional.softmax(output_tensor[0], dim=0)
         # Show top categories per image
         top5_prob, top5_catid = torch.topk(probabilities, 5)
+        classify_result = []
         for i in range(top5_prob.size(0)):
-            rst.append((self.categories[top5_catid[i]], top5_prob[i].item()))
+            classify_result.append((self.categories[top5_catid[i]], top5_prob[i].item()))
 
-        return rst
+        return {
+            "classify_result": classify_result,
+            "model_version": self.version,
+            "last_layer_weights": feat.numpy(),
+        }
 
-@ray.remote
+@serve.deployment
 class MaskRCNN:
     def __init__(self):
-        from torchvision.models.detection import maskrcnn_resnet50_fpn
-        self.model = maskrcnn_resnet50_fpn(pretrained=True).eval()
+        self.model = models.detection.maskrcnn_resnet50_fpn(pretrained=True).eval()
 
     def forward(self, input_tensor_objectref):
         input_tensor = ray.get(input_tensor_objectref)
-        output_boxes = self.model(input_tensor)
-        return input_tensor, output_boxes
+        with torch.no_grad():
+            output_boxes = self.model(input_tensor)
+        return [{k: v.numpy() for k,v in box.items()} for box in output_boxes]
 
-@ray.remote
+@serve.deployment
 class ImageCaption:
     def __init__(self):
         # Load vocabulary wrapper
@@ -172,10 +190,11 @@ class ImageCaption:
         self.encoder.load_state_dict(torch.load("models/encoder-5-3000.pkl"))
         self.decoder.load_state_dict(torch.load("models/decoder-5-3000.pkl"))
 
-    def forward(self, input_tensor_objectref):
-        image_tensor = ray.get(input_tensor_objectref)
+    def forward(self, mask_rnn_reslt, resnet_result):
+        resnet_feature = resnet_result["last_layer_weights"]
+
         # Generate an caption from the image
-        feature = self.encoder(image_tensor)
+        feature = self.encoder(resnet_feature)
         sampled_ids = self.decoder.sample(feature)
         sampled_ids = sampled_ids[0].cpu().numpy()
 
@@ -190,13 +209,30 @@ class ImageCaption:
 
         return sentence
 
-@ray.remote
+@serve.deployment
+class DynamicDispatch:
+    def __init__(self, *handles):
+        self.handles = handles
+
+    async def forward(self, inp_tensor, inp: "ContentInput"):
+        # selection logic
+        chosen_idx = inp.user_id % len(self.handles)
+        chosen_handle = self.handles[chosen_idx]
+        return await chosen_handle.forward.remote(inp_tensor)
+
+@serve.deployment
 def combine(resnet, mask_r_cnn, captioning):
     return {
-        "resnet": resnet,
         "captioning": captioning,
-        "mask_r_cnn": mask_r_cnn
+        # "resnet": resnet,
+        # "mask_r_cnn": mask_r_cnn
+        # no resnet and mask result direclty, too many nubmers and have json serde issue.
     }
+
+
+# TODO: return image here.
+# https://stackoverflow.com/questions/55873174/how-do-i-return-an-image-in-fastapi
+# Demo note: use browser tab, not docs pages. docs page only work for JSON
 
 # def show_aggregated_result():
 #     from torchvision.utils import draw_bounding_boxes
@@ -227,29 +263,34 @@ def combine(resnet, mask_r_cnn, captioning):
 #     ]
 #     show(dogs_with_boxes)
 
-if __name__ == "__main__":
 
-    print("Started running DAG ...")
-    # Return image with metadata
-    # url = "https://github.com/EliSchwartz/imagenet-sample-images/blob/master/n07753275_pineapple.JPEG?raw=true"
-    url = "https://miro.medium.com/max/1400/1*gMR3ezxjF46IykyTK6MV9w.jpeg"
+def input_schema_from_args(image_url: str, user_id: int) :
+    return ContentInput(image_url=image_url, user_id=user_id)
 
-    downloaded_image_bytes = download.bind(url)
 
-    preprocessor = Preprocessor.bind()
+preprocessor = Preprocessor.bind()
+resnets = [
+    ResNetClassify.bind(version=i)
+    for i in range(3)
+]
+mask_rcnn = MaskRCNN.bind()
+image_caption = ImageCaption.bind()
+with InputNode() as inp:
+    downloaded_image_bytes = download.bind(inp)
     input_tensor_objectref = preprocessor.preprocess.bind(downloaded_image_bytes)
 
-
-    resnet = ResNetClassify.bind()
-    mask_rcnn = MaskRCNN.bind()
-    image_caption = ImageCaption.bind()
-
-
-    resnet_output = resnet.forward.bind(input_tensor_objectref)
+    dispatch = DynamicDispatch.bind(*resnets)
+    resnet_output = dispatch.forward.bind(input_tensor_objectref, inp)
     mask_rcnnoutput = mask_rcnn.forward.bind(input_tensor_objectref)
-    image_caption_output = image_caption.forward.bind(input_tensor_objectref)
+    image_caption_output = image_caption.forward.bind(mask_rcnnoutput, resnet_output)
 
     dag = combine.bind(resnet_output, mask_rcnnoutput, image_caption_output)
-    rst = ray.get(dag.execute())
-    for key, val in rst.items():
-        print(key, val)
+
+    serve_entrypoint = DAGDriver.bind(dag, input_schema="deployment_graph.input_schema_from_args")
+
+if __name__ == "__main__":
+    print("Started running DAG locally...")
+    url = "https://miro.medium.com/max/1400/1*gMR3ezxjF46IykyTK6MV9w.jpeg"
+    rst = ray.get(dag.execute(ContentInput(image_url=url, user_id=2)))
+    print(rst)
+
