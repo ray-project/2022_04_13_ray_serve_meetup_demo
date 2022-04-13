@@ -1,3 +1,4 @@
+#%%
 from io import BytesIO
 from pydantic import BaseModel
 
@@ -96,12 +97,12 @@ class ContentInput(BaseModel):
     image_url: str
     user_id: int
 
-@serve.deployment
+@serve.deployment(ray_actor_options={"num_cpus": 0.5})
 def downloader(inp: "ContentInput"):
     """Download HTTP content, in production this can be business logic downloading from other services"""
     return requests.get(inp.image_url).content
 
-@serve.deployment
+@serve.deployment(ray_actor_options={"num_cpus": 0.5})
 class Preprocessor:
     """Image preprocessor with imagenet normalization."""
     def __init__(self):
@@ -110,7 +111,7 @@ class Preprocessor:
                 transforms.Resize([224, 224]),
                 transforms.CenterCrop(224),
                 transforms.ToTensor(),
-                # transforms.Lambda(lambda t: t[:3, ...]),  # remove alpha channel
+                transforms.Lambda(lambda t: t[:3, ...]),  # remove alpha channel
                 # pixel values must be in the range [0,1] and we must then
                 # normalize the image by the mean and standard deviation
                 # of the ImageNet images' RGB channels.
@@ -127,7 +128,7 @@ class Preprocessor:
         return ray.put(input_tensor)
 
 
-@serve.deployment
+@serve.deployment(ray_actor_options={"num_cpus": 0.5})
 class ImageClassification_ResNet:
     def __init__(self, version: int):
         # Read the categories
@@ -159,7 +160,7 @@ class ImageClassification_ResNet:
             "last_layer_weights": feat.numpy(),
         }
 
-@serve.deployment
+@serve.deployment(ray_actor_options={"num_cpus": 0.5})
 class ObjectDetection_MaskRCNN:
     def __init__(self):
         self.model = models.detection.maskrcnn_resnet50_fpn(pretrained=True).eval()
@@ -167,10 +168,11 @@ class ObjectDetection_MaskRCNN:
     def forward(self, input_tensor_objectref):
         input_tensor = ray.get(input_tensor_objectref)
         with torch.no_grad():
-            output_boxes = self.model(input_tensor)
-        return [{k: v.numpy() for k,v in box.items()} for box in output_boxes]
+            return self.model(input_tensor)
 
-@serve.deployment
+        # return [{k: v.numpy() for k,v in box.items()} for box in output_boxes]
+
+@serve.deployment(ray_actor_options={"num_cpus": 0.5})
 class ImageCaption_ResNet_LSTM:
     def __init__(self):
         # Load vocabulary wrapper
@@ -189,8 +191,8 @@ class ImageCaption_ResNet_LSTM:
         self.encoder.load_state_dict(torch.load("models/encoder-5-3000.pkl"))
         self.decoder.load_state_dict(torch.load("models/decoder-5-3000.pkl"))
 
-    def forward(self, mask_rnn_result, resnet_result):
-        resnet_feature = resnet_result["last_layer_weights"]
+    def forward(self, detection_result, classifier_result):
+        resnet_feature = classifier_result["last_layer_weights"]
 
         # Generate an caption from the image
         feature = self.encoder(resnet_feature)
@@ -208,91 +210,111 @@ class ImageCaption_ResNet_LSTM:
 
         return sentence
 
-@serve.deployment
+@serve.deployment(ray_actor_options={"num_cpus": 0.5})
 class DynamicDispatch:
-    def __init__(self, *handles):
-        self.handles = handles
+    def __init__(self, *classifier_models):
+        self.classifier_models = classifier_models
 
     async def forward(self, inp_tensor, inp: "ContentInput"):
         # selection logic
-        chosen_idx = inp.user_id % len(self.handles)
-        chosen_handle = self.handles[chosen_idx]
-        return await chosen_handle.forward.remote(inp_tensor)
+        chosen_idx = inp.user_id % len(self.classifier_models)
+        chosen_model = self.classifier_models[chosen_idx]
+        return await chosen_model.forward.remote(inp_tensor)
 
-@serve.deployment
-def combine(resnet, mask_r_cnn, captioning):
+@serve.deployment(ray_actor_options={"num_cpus": 0.5})
+def combine(image_ref, classify, object_detection, caption):
+    # Cast to uint8 for showing segmentation
+    image = ray.get(image_ref).squeeze().type(torch.uint8)
     return {
-        "captioning": captioning,
-        "resnet_version": resnet["model_version"],
-        "classify_result": resnet["classify_result"]
-        # "mask_r_cnn": mask_r_cnn
+        "caption": caption,
+        "resnet_version": classify["model_version"],
+        "classify_result": classify["classify_result"],
+        "image": image,
+        "object_detection": object_detection
         # no resnet and mask result direclty, too many nubmers and have json serde issue.
     }
 
 
-# TODO: return image here.
-# https://stackoverflow.com/questions/55873174/how-do-i-return-an-image-in-fastapi
-# Demo note: use browser tab, not docs pages. docs page only work for JSON
+def show_segmentation(rst):
+    inst_classes = [
+        '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+        'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A', 'stop sign',
+        'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+        'elephant', 'bear', 'zebra', 'giraffe', 'N/A', 'backpack', 'umbrella', 'N/A', 'N/A',
+        'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+        'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+        'bottle', 'N/A', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl',
+        'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza',
+        'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 'N/A', 'dining table',
+        'N/A', 'N/A', 'toilet', 'N/A', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+        'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A', 'book',
+        'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+    ]
 
-# def show_aggregated_result():
-#     from torchvision.utils import draw_bounding_boxes
-#     import torch
-#     import numpy as np
-#     import matplotlib.pyplot as plt
+    import torch
+    from torchvision.utils import draw_segmentation_masks
 
-#     import torchvision.transforms.functional as F
-#     from torchvision.transforms import ConvertImageDtype
-#     from torchvision.transforms.functional import convert_image_dtype
-#     image = ConvertImageDtype(torch.uint8)(input_tensor)
+    image = rst["image"]
+    detection_output = rst["object_detection"][0]
 
-#     plt.rcParams["savefig.bbox"] = 'tight'
+    dog1_masks = detection_output['masks']
+    inst_class_to_idx = {cls: idx for (idx, cls) in enumerate(inst_classes)}
 
-#     def show(imgs):
-#         if not isinstance(imgs, list):
-#             imgs = [imgs]
-#         fix, axs = plt.subplots(ncols=len(imgs), squeeze=False)
-#         for i, img in enumerate(imgs):
-#             img = img.detach()
-#             img = F.to_pil_image(img)
-#             axs[0, i].imshow(np.asarray(img))
-#             axs[0, i].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
+    proba_threshold = 0.8
+    bool_masks = detection_output['masks'] > proba_threshold
 
-#     score_threshold = .8
-#     dogs_with_boxes = [
-#         draw_bounding_boxes(image, boxes=output_box['boxes'][output_box['scores'] > score_threshold], width=4)
-#     ]
-#     show(dogs_with_boxes)
+    # There's an extra dimension (1) to the masks. We need to remove it
+    bool_masks = bool_masks.squeeze(1)
 
+    import numpy as np
+    import matplotlib.pyplot as plt
 
-# Let's build the DAG
-def input_schema_from_args(image_url: str, user_id: int) :
-    return ContentInput(image_url=image_url, user_id=user_id)
+    import torchvision.transforms.functional as F
+
+    def show(imgs):
+        if not isinstance(imgs, list):
+            imgs = [imgs]
+        fix, axs = plt.subplots(ncols=len(imgs), squeeze=False)
+        for i, img in enumerate(imgs):
+            img = img.detach()
+            img = F.to_pil_image(img)
+            axs[0, i].imshow(np.asarray(img))
+            axs[0, i].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
+
+    show(draw_segmentation_masks(image, bool_masks, alpha=0.7))
+
 
 preprocessor = Preprocessor.bind()
 classifiers = [
-    ImageClassification_ResNet.bind(version=i)
-    for i in range(3)
+    ImageClassification_ResNet.bind(i) for i in range(3)
 ]
-dynamic_dispatcher = DynamicDispatch.bind(*classifiers)
-object_detection_model = ObjectDetection_MaskRCNN.bind()
-image_caption_model = ImageCaption_ResNet_LSTM.bind()
+dynamic_dispatch = DynamicDispatch.bind(*classifiers)
+object_detection = ObjectDetection_MaskRCNN.bind()
+image_caption = ImageCaption_ResNet_LSTM.bind()
 
-with InputNode() as user_input_data:
-    downloaded_image_bytes = downloader.bind(user_input_data)
-    input_image_tensor = preprocessor.preprocess.bind(downloaded_image_bytes)
+def input_adapter(image_url: str, user_id: int):
+    return ContentInput(image_url=image_url, user_id=user_id)
 
-    classifier_output = dynamic_dispatcher.forward.bind(input_image_tensor, user_input_data)
-    object_detection_output = object_detection_model.forward.bind(input_image_tensor)
-    image_caption_output = image_caption_model.forward.bind(object_detection_output, classifier_output)
+# Let's build the DAG
+with InputNode() as user_input:
+    image_bytes = downloader.bind(user_input)
+    image_tensor = preprocessor.preprocess.bind(image_bytes)
+    classify_output = dynamic_dispatch.forward.bind(image_tensor, user_input)
+    object_detection_output = object_detection.forward.bind(image_tensor)
+    caption_output = image_caption.forward.bind(object_detection_output, classify_output)
 
-    dag = combine.bind(classifier_output, object_detection_output, image_caption_output)
+    dag = combine.bind(image_tensor, classify_output, object_detection_output, caption_output)
+    serve_entrypoint = DAGDriver.bind(dag, input_schema="deployment_graph.input_adapter")
 
-    serve_entrypoint = DAGDriver.bind(dag, input_schema="deployment_graph.input_schema_from_args")
 
 if __name__ == "__main__":
     print("Started running DAG locally...")
-    # url = "https://miro.medium.com/max/1400/1*gMR3ezxjF46IykyTK6MV9w.jpeg"
     url = "https://github.com/EliSchwartz/imagenet-sample-images/blob/master/n01833805_hummingbird.JPEG?raw=true"
     rst = ray.get(dag.execute(ContentInput(image_url=url, user_id=2)))
-    for key, val in rst.items():
-        print(key, val)
+    print(rst)
+
+    # show_segmentation(rst)
+    # print(rst["caption"])
+    # print(f"Classifier version: {rst['resnet_version']}")
+    # for val in rst["classify_result"]:
+    #     print(val)
