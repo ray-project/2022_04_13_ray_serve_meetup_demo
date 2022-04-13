@@ -96,12 +96,8 @@ class ContentInput(BaseModel):
     image_url: str
     user_id: int
 
-@serve.deployment(
-    ray_actor_options={
-        "num_cpus": 0.5
-    }
-)
-def download(inp: "ContentInput"):
+@serve.deployment
+def downloader(inp: "ContentInput"):
     """Download HTTP content, in production this can be business logic downloading from other services"""
     return requests.get(inp.image_url).content
 
@@ -131,11 +127,7 @@ class Preprocessor:
         return ray.put(input_tensor)
 
 
-@serve.deployment(
-    ray_actor_options={
-        "num_cpus": 0.5
-    }
-)
+@serve.deployment
 class ImageClassification_ResNet:
     def __init__(self, version: int):
         # Read the categories
@@ -149,7 +141,6 @@ class ImageClassification_ResNet:
 
 
     def forward(self, input_tensor):
-        # input_tensor = ray.get(input_tensor_objectref)
         with torch.no_grad():
             feat = self.head(input_tensor)
             output_tensor = self.tail(feat.reshape(feat.size(0), -1))
@@ -168,11 +159,7 @@ class ImageClassification_ResNet:
             "last_layer_weights": feat.numpy(),
         }
 
-@serve.deployment(
-    ray_actor_options={
-        "num_cpus": 0.5
-    }
-)
+@serve.deployment
 class ObjectDetection_MaskRCNN:
     def __init__(self):
         self.model = models.detection.maskrcnn_resnet50_fpn(pretrained=True).eval()
@@ -183,11 +170,7 @@ class ObjectDetection_MaskRCNN:
             output_boxes = self.model(input_tensor)
         return [{k: v.numpy() for k,v in box.items()} for box in output_boxes]
 
-@serve.deployment(
-    ray_actor_options={
-        "num_cpus": 0.5
-    }
-)
+@serve.deployment
 class ImageCaption_ResNet_LSTM:
     def __init__(self):
         # Load vocabulary wrapper
@@ -225,11 +208,7 @@ class ImageCaption_ResNet_LSTM:
 
         return sentence
 
-@serve.deployment(
-    ray_actor_options={
-        "num_cpus": 0.5
-    }
-)
+@serve.deployment
 class DynamicDispatch:
     def __init__(self, *handles):
         self.handles = handles
@@ -240,15 +219,12 @@ class DynamicDispatch:
         chosen_handle = self.handles[chosen_idx]
         return await chosen_handle.forward.remote(inp_tensor)
 
-@serve.deployment(
-    ray_actor_options={
-        "num_cpus": 0.5
-    }
-)
+@serve.deployment
 def combine(resnet, mask_r_cnn, captioning):
     return {
         "captioning": captioning,
         "resnet_version": resnet["model_version"],
+        "classify_result": resnet["classify_result"]
         # "mask_r_cnn": mask_r_cnn
         # no resnet and mask result direclty, too many nubmers and have json serde issue.
     }
@@ -293,23 +269,23 @@ def input_schema_from_args(image_url: str, user_id: int) :
     return ContentInput(image_url=image_url, user_id=user_id)
 
 preprocessor = Preprocessor.bind()
-resnets = [
+classifiers = [
     ImageClassification_ResNet.bind(version=i)
     for i in range(3)
 ]
-resnet_dispatch = DynamicDispatch.bind(*resnets)
-mask_rcnn = ObjectDetection_MaskRCNN.bind()
-image_caption = ImageCaption_ResNet_LSTM.bind()
+dynamic_dispatcher = DynamicDispatch.bind(*classifiers)
+object_detection_model = ObjectDetection_MaskRCNN.bind()
+image_caption_model = ImageCaption_ResNet_LSTM.bind()
 
-with InputNode() as inp:
-    downloaded_image_bytes = download.bind(inp)
-    input_tensor = preprocessor.preprocess.bind(downloaded_image_bytes)
+with InputNode() as user_input_data:
+    downloaded_image_bytes = downloader.bind(user_input_data)
+    input_image_tensor = preprocessor.preprocess.bind(downloaded_image_bytes)
 
-    resnet_output = resnet_dispatch.forward.bind(input_tensor, inp)
-    mask_rcnnoutput = mask_rcnn.forward.bind(input_tensor)
-    image_caption_output = image_caption.forward.bind(mask_rcnnoutput, resnet_output)
+    classifier_output = dynamic_dispatcher.forward.bind(input_image_tensor, user_input_data)
+    object_detection_output = object_detection_model.forward.bind(input_image_tensor)
+    image_caption_output = image_caption_model.forward.bind(object_detection_output, classifier_output)
 
-    dag = combine.bind(resnet_output, mask_rcnnoutput, image_caption_output)
+    dag = combine.bind(classifier_output, object_detection_output, image_caption_output)
 
     serve_entrypoint = DAGDriver.bind(dag, input_schema="deployment_graph.input_schema_from_args")
 
