@@ -99,8 +99,19 @@ class ContentInput(BaseModel):
 
 @serve.deployment(ray_actor_options={"num_cpus": 0.5})
 def downloader(inp: "ContentInput"):
+    import hashlib
+    import os
     """Download HTTP content, in production this can be business logic downloading from other services"""
-    return requests.get(inp.image_url).content
+    hash_object = hashlib.md5(inp.image_url.encode())
+    hash_str_path = hash_object.hexdigest()
+    if os.path.exists(hash_str_path):
+        with open(hash_str_path, "rb") as f:
+            return f.read()
+    else:
+        image_bytes = requests.get(inp.image_url).content
+        with open(hash_str_path, "wb") as f:
+            f.write(image_bytes)
+        return image_bytes
 
 @serve.deployment(ray_actor_options={"num_cpus": 0.5})
 class Preprocessor:
@@ -161,7 +172,18 @@ class ImageClassification_ResNet:
         }
 
 @serve.deployment(ray_actor_options={"num_cpus": 0.5})
-class ObjectDetection_MaskRCNN:
+class DynamicDispatch:
+    def __init__(self, *classifier_models):
+        self.classifier_models = classifier_models
+
+    async def forward(self, inp_tensor, inp: "ContentInput"):
+        # selection logic
+        chosen_idx = inp.user_id % len(self.classifier_models)
+        chosen_model = self.classifier_models[chosen_idx]
+        return await chosen_model.forward.remote(inp_tensor)
+
+@serve.deployment(ray_actor_options={"num_cpus": 2})
+class ImageSegmentation_MaskRCNN:
     def __init__(self):
         self.model = models.detection.maskrcnn_resnet50_fpn(pretrained=True).eval()
 
@@ -191,7 +213,7 @@ class ImageCaption_ResNet_LSTM:
         self.encoder.load_state_dict(torch.load("models/encoder-5-3000.pkl"))
         self.decoder.load_state_dict(torch.load("models/decoder-5-3000.pkl"))
 
-    def forward(self, detection_result, classifier_result):
+    def forward(self, segmentation, classifier_result):
         resnet_feature = classifier_result["last_layer_weights"]
 
         # Generate an caption from the image
@@ -211,18 +233,7 @@ class ImageCaption_ResNet_LSTM:
         return sentence
 
 @serve.deployment(ray_actor_options={"num_cpus": 0.5})
-class DynamicDispatch:
-    def __init__(self, *classifier_models):
-        self.classifier_models = classifier_models
-
-    async def forward(self, inp_tensor, inp: "ContentInput"):
-        # selection logic
-        chosen_idx = inp.user_id % len(self.classifier_models)
-        chosen_model = self.classifier_models[chosen_idx]
-        return await chosen_model.forward.remote(inp_tensor)
-
-@serve.deployment(ray_actor_options={"num_cpus": 0.5})
-def combine(image_ref, classify, object_detection, caption):
+def combine(image_ref, classify, segmentation, caption):
     # Cast to uint8 for showing segmentation
     image = ray.get(image_ref).squeeze().type(torch.uint8)
     return {
@@ -230,7 +241,7 @@ def combine(image_ref, classify, object_detection, caption):
         "resnet_version": classify["model_version"],
         "classify_result": classify["classify_result"],
         "image": image,
-        "object_detection": object_detection
+        "segmentation": segmentation
         # no resnet and mask result direclty, too many nubmers and have json serde issue.
     }
 
@@ -255,7 +266,7 @@ def show_segmentation(rst):
     from torchvision.utils import draw_segmentation_masks
 
     image = rst["image"]
-    detection_output = rst["object_detection"][0]
+    detection_output = rst["segmentation"][0]
 
     dog1_masks = detection_output['masks']
     inst_class_to_idx = {cls: idx for (idx, cls) in enumerate(inst_classes)}
@@ -284,37 +295,48 @@ def show_segmentation(rst):
     show(draw_segmentation_masks(image, bool_masks, alpha=0.7))
 
 
+
+
+
+
+
+
+
+# Let's Build the DAG here !!
 preprocessor = Preprocessor.bind()
 classifiers = [
     ImageClassification_ResNet.bind(i) for i in range(3)
 ]
-dynamic_dispatch = DynamicDispatch.bind(*classifiers)
-object_detection = ObjectDetection_MaskRCNN.bind()
-image_caption = ImageCaption_ResNet_LSTM.bind()
+dispatcher = DynamicDispatch.bind(*classifiers)
+segmentation = ImageSegmentation_MaskRCNN.bind()
+caption = ImageCaption_ResNet_LSTM.bind()
 
 def input_adapter(image_url: str, user_id: int):
     return ContentInput(image_url=image_url, user_id=user_id)
 
-# Let's build the DAG
 with InputNode() as user_input:
     image_bytes = downloader.bind(user_input)
     image_tensor = preprocessor.preprocess.bind(image_bytes)
-    classify_output = dynamic_dispatch.forward.bind(image_tensor, user_input)
-    object_detection_output = object_detection.forward.bind(image_tensor)
-    caption_output = image_caption.forward.bind(object_detection_output, classify_output)
 
-    dag = combine.bind(image_tensor, classify_output, object_detection_output, caption_output)
+    classification_output = dispatcher.forward.bind(image_tensor, user_input)
+    segmentation_output = segmentation.forward.bind(image_tensor)
+    caption_output = caption.forward.bind(segmentation_output, classification_output)
+    # combine(image_ref, classify, segmentation, caption)
+    dag = combine.bind(image_tensor, classification_output, segmentation_output, caption_output)
+
     serve_entrypoint = DAGDriver.bind(dag, input_schema="deployment_graph.input_adapter")
-
 
 if __name__ == "__main__":
     print("Started running DAG locally...")
     url = "https://github.com/EliSchwartz/imagenet-sample-images/blob/master/n01833805_hummingbird.JPEG?raw=true"
-    rst = ray.get(dag.execute(ContentInput(image_url=url, user_id=2)))
-    print(rst)
 
-    # show_segmentation(rst)
-    # print(rst["caption"])
-    # print(f"Classifier version: {rst['resnet_version']}")
-    # for val in rst["classify_result"]:
-    #     print(val)
+    user_input = ContentInput(image_url=url, user_id=1)
+    rst = ray.get(dag.execute(user_input))
+    # print(rst)
+    show_segmentation(rst)
+    print(rst["caption"])
+    print(f"Classifier version: {rst['resnet_version']}")
+    for val in rst["classify_result"]:
+        print(val)
+
+# %%
