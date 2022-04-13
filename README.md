@@ -6,4 +6,4 @@ Code samples for Ray Serve Meetup on 04/13/2022
 - `python deployment_graph.py` should execute the dag locally
 - `serve run deployment_graph.serve_entrypoint` to deploy to Serve cluster. and use http://localhost:8000/docs call.
 - `serve build deployment_graph.serve_entrypoint > config.yaml`
-- `ray start --head` and `serve deploy config.yaml`
+- `ray start --head`, `serve start`, and `serve deploy config.yaml`
