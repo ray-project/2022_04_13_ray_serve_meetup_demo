@@ -291,6 +291,8 @@ with InputNode() as user_input_data:
 
 if __name__ == "__main__":
     print("Started running DAG locally...")
-    url = "https://miro.medium.com/max/1400/1*gMR3ezxjF46IykyTK6MV9w.jpeg"
+    # url = "https://miro.medium.com/max/1400/1*gMR3ezxjF46IykyTK6MV9w.jpeg"
+    url = "https://github.com/EliSchwartz/imagenet-sample-images/blob/master/n01833805_hummingbird.JPEG?raw=true"
     rst = ray.get(dag.execute(ContentInput(image_url=url, user_id=2)))
-    print(rst)
+    for key, val in rst.items():
+        print(key, val)
